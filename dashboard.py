@@ -1,5 +1,5 @@
 # dashboard.py
-# Fixed and cleaned Monetary Policy & Inflation Dashboard
+# Defensive Monetary Policy & Inflation Dashboard (Streamlit)
 # Requirements: pip install streamlit pandas plotly requests openpyxl
 
 import streamlit as st
@@ -8,13 +8,78 @@ st.set_page_config(page_title="Monetary Policy & Inflation Dashboard", layout="w
 import pandas as pd
 import numpy as np
 import requests
+import plotly
 import plotly.express as px
 
 from datetime import datetime, timedelta
 import io
+import traceback
 
 # -------------------------
-# Helper functions
+# Diagnostic: confirm plotly import
+# -------------------------
+try:
+    st.experimental_get_query_params()  # cheap operation to ensure Streamlit is alive
+    st.write(f"plotly imported: version={plotly.__version__}")
+except Exception:
+    # If Streamlit itself is failing this won't help, but normally we'll see plotly version
+    pass
+
+# -------------------------
+# Helpers: safe plotting + utilities
+# -------------------------
+def safe_px_line(df_or_series, *args, title=None, labels=None, **kwargs):
+    """
+    Wrap px.line so we can see the real exception in Streamlit UI if plotting fails.
+    Also normalizes input (reset_index and rename) so px gets consistent input.
+    Returns a figure or None on failure.
+    """
+    try:
+        if df_or_series is None or (hasattr(df_or_series, "empty") and df_or_series.empty):
+            st.info("Plot skipped: no data provided.")
+            return None
+
+        # If this is a Series, convert to DataFrame
+        if isinstance(df_or_series, pd.Series):
+            df_plot = df_or_series.to_frame()
+        else:
+            df_plot = df_or_series.copy()
+
+        # If index is DatetimeIndex, reset it for px
+        if isinstance(df_plot.index, (pd.DatetimeIndex, pd.Index)):
+            df_plot = df_plot.reset_index()
+            # Ensure index column has a friendly name 'Date' if unnamed
+            if df_plot.columns[0] == 0:
+                df_plot = df_plot.rename(columns={0: "Date"})
+
+        # If single unnamed column, give it a name
+        if df_plot.shape[1] == 1:
+            if df_plot.columns[0] == 0 or df_plot.columns[0] == "":
+                df_plot.columns = ["value"]
+        # call px.line
+        fig = px.line(df_plot, *args, title=title, labels=labels, **kwargs)
+        return fig
+    except Exception:
+        st.error("px.line() raised an exception — full traceback below:")
+        st.exception(traceback.format_exc())
+        return None
+
+
+def df_to_csv_bytes(df: pd.DataFrame):
+    buf = io.StringIO()
+    df.to_csv(buf, index=True)
+    return buf.getvalue().encode('utf-8')
+
+
+def yoy_pct_change(df: pd.DataFrame, periods=12):
+    """12-month year-over-year % change."""
+    if df is None or getattr(df, "empty", True):
+        return pd.DataFrame()
+    return df.pct_change(periods=periods) * 100
+
+
+# -------------------------
+# Data fetchers (cached)
 # -------------------------
 @st.cache_data(ttl=3600)
 def fetch_fred_series(series_id: str, api_key: str, start=None, end=None):
@@ -43,9 +108,11 @@ def fetch_fred_series(series_id: str, api_key: str, start=None, end=None):
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame()
-    df["date"] = pd.to_datetime(df["date"])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.set_index("date").sort_index()
+    # if the column name is the series_id, keep it
     return df
+
 
 @st.cache_data(ttl=3600)
 def fetch_worldbank_inflation(iso3: str, startyear=2010, endyear=None):
@@ -65,7 +132,10 @@ def fetch_worldbank_inflation(iso3: str, startyear=2010, endyear=None):
         val = item.get("value")
         if val is None:
             continue
-        rows.append({"year": int(year), iso3: float(val)})
+        try:
+            rows.append({"year": int(year), iso3: float(val)})
+        except Exception:
+            continue
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame()
@@ -73,24 +143,11 @@ def fetch_worldbank_inflation(iso3: str, startyear=2010, endyear=None):
     return df
 
 
-def yoy_pct_change(df: pd.DataFrame, periods=12):
-    """12-month year-over-year % change."""
-    if df.empty:
-        return pd.DataFrame()
-    return df.pct_change(periods=periods) * 100
-
-
-def df_to_csv_bytes(df: pd.DataFrame):
-    buf = io.StringIO()
-    df.to_csv(buf)
-    return buf.getvalue().encode('utf-8')
-
 # -------------------------
 # Sidebar controls
 # -------------------------
 st.sidebar.header("Controls & Data sources")
 
-# FRED API key: try secrets then ask user
 default_fred = st.secrets.get("FRED_API_KEY") if "FRED_API_KEY" in st.secrets else ""
 fred_key = st.sidebar.text_input(
     "FRED API key (optional for US series)",
@@ -98,20 +155,17 @@ fred_key = st.sidebar.text_input(
     type="password"
 )
 
-# Date range
 today = datetime.today().date()
 default_start = (today - timedelta(days=365 * 5)).isoformat()
 start_date = st.sidebar.date_input("Start date", value=pd.to_datetime(default_start))
 end_date = st.sidebar.date_input("End date", value=pd.to_datetime(today))
 
-# Countries for world comparison
 countries = st.sidebar.multiselect(
     "Compare countries (World Bank ISO3)",
     ["IND", "USA", "CHN", "GBR", "DEU", "WLD"],
     default=["IND", "USA"]
 )
 
-# India CPI: allow upload
 st.sidebar.markdown("---")
 st.sidebar.subheader("India CPI (MoSPI)")
 uploaded_file = st.sidebar.file_uploader(
@@ -119,7 +173,6 @@ uploaded_file = st.sidebar.file_uploader(
     type=["xls", "xlsx", "csv"]
 )
 
-# Options
 show_forecast = st.sidebar.checkbox(
     "Show simple CPI nowcast (illustrative)",
     value=False
@@ -153,8 +206,9 @@ if fred_key:
         us_m2 = fetch_fred_series("M2SL", fred_key, start=start_date.isoformat(), end=end_date.isoformat())
         fedfunds = fetch_fred_series("FEDFUNDS", fred_key, start=start_date.isoformat(), end=end_date.isoformat())
         st.success("US series fetched.")
-    except Exception as e:
-        st.error(f"Error fetching FRED data: {e}")
+    except Exception:
+        st.error("Error fetching FRED data — check your key and internet connection.")
+        st.exception(traceback.format_exc())
 
 # -------------------------
 # India CPI: upload parsing
@@ -165,33 +219,26 @@ if uploaded_file is not None:
         st.info("Reading uploaded file...")
         if uploaded_file.name.lower().endswith((".xls", ".xlsx")):
             xls = pd.read_excel(uploaded_file, sheet_name=None)
-            # pick first sheet and try to parse common patterns
             sheetname = list(xls.keys())[0]
             df_try = xls[sheetname].copy()
-            # try to find date and CPI/index columns
             date_col = None
             value_col = None
             for c in df_try.columns:
-                # simple heuristics
                 if pd.api.types.is_datetime64_any_dtype(df_try[c]):
                     date_col = c
                 if isinstance(c, str) and ("cpi" in c.lower() or "index" in c.lower()):
                     value_col = c
             if date_col is None:
-                # try first column as date
                 df_try.iloc[:, 0] = pd.to_datetime(df_try.iloc[:, 0], errors="coerce")
                 date_col = df_try.columns[0]
             if value_col is None and df_try.shape[1] >= 2:
                 value_col = df_try.columns[1]
-            # build ind_cpi
             df_try = df_try[[date_col, value_col]].dropna()
             df_try.columns = ["date", "CPI"]
             df_try["date"] = pd.to_datetime(df_try["date"], errors="coerce")
             ind_cpi = df_try.set_index("date").sort_index()
         else:
-            # csv
             df_try = pd.read_csv(uploaded_file)
-            # try common names
             date_candidates = [c for c in df_try.columns if str(c).lower() in ("date", "month", "period")]
             value_candidates = [c for c in df_try.columns if "cpi" in str(c).lower() or "index" in str(c).lower()]
             if date_candidates and value_candidates:
@@ -202,7 +249,6 @@ if uploaded_file is not None:
                 ind_cpi.columns = ["date", "CPI"]
                 ind_cpi = ind_cpi.set_index("date").sort_index()
             else:
-                # fallback: assume first two columns
                 df_try.iloc[:, 0] = pd.to_datetime(df_try.iloc[:, 0], errors="coerce")
                 ind_cpi = df_try.iloc[:, :2].dropna()
                 ind_cpi.columns = ["date", "CPI"]
@@ -211,8 +257,9 @@ if uploaded_file is not None:
             st.success("India CPI parsed from uploaded file.")
         else:
             st.warning("Uploaded file could not be parsed automatically; ensure it has a date and CPI/index column.")
-    except Exception as e:
-        st.error(f"Error reading uploaded file: {e}")
+    except Exception:
+        st.error("Error reading uploaded file:")
+        st.exception(traceback.format_exc())
 
 # -------------------------
 # Derived series
@@ -230,15 +277,24 @@ st.markdown("## Key indicators (latest)")
 k1, k2, k3, k4 = st.columns(4)
 
 def last_value(df, col=None):
-    if df.empty:
+    if df is None or (hasattr(df, "empty") and df.empty):
         return None
-    if col:
-        s = df[col].dropna()
-    else:
-        s = df.dropna().iloc[:, 0] if not df.empty else pd.Series(dtype=float)
-    if s.empty:
+    try:
+        if col:
+            s = df[col].dropna()
+        else:
+            if isinstance(df, pd.DataFrame):
+                s = df.dropna().iloc[:, 0]
+            else:
+                s = df.dropna()
+    except Exception:
         return None
-    return s.iloc[-1]
+    if getattr(s, "empty", False):
+        return None
+    # if Series, return scalar
+    if isinstance(s, pd.Series):
+        return s.iloc[-1]
+    return s
 
 with k1:
     v = last_value(us_cpi_yoy, None)
@@ -257,19 +313,24 @@ with k2:
 with k3:
     v = last_value(us_m2_yoy, None)
     if v is not None:
-        # handle Series vs scalar
         try:
-            display_val = v.iloc[0] if isinstance(v, pd.Series) else v
+            display_val = v.iloc[0] if isinstance(v, (pd.Series, np.ndarray)) else v
             st.metric("US M2 YoY (%)", f"{display_val:.2f}")
         except Exception:
-            st.metric("US M2 YoY (%)", f"{v:.2f}")
+            try:
+                st.metric("US M2 YoY (%)", f"{float(v):.2f}")
+            except Exception:
+                st.write("US M2 YoY: -")
     else:
         st.write("US M2 YoY: -")
 
 with k4:
     v = last_value(fedfunds, None)
     if v is not None:
-        st.metric("Fed funds (%)", f"{v:.2f}")
+        try:
+            st.metric("Fed funds (%)", f"{float(v):.2f}")
+        except Exception:
+            st.write("Fed funds: -")
     else:
         st.write("Fed funds: -")
 
@@ -281,18 +342,15 @@ st.header("US: CPI & Liquidity")
 
 # US CPI levels plot
 if not us_cpi.empty and not us_core.empty:
-    # rename columns to friendly names
     left = us_cpi.copy()
     right = us_core.copy()
     left.columns = ["US CPI"]
     right.columns = ["US Core CPI"]
     df_levels = pd.concat([left, right], axis=1).dropna()
-    fig = px.line(
-        df_levels,
-        labels={"value": "Index", "index": "Date"},
-        title="US CPI (index) and Core CPI"
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    fig = safe_px_line(df_levels, title="US CPI (index) and Core CPI",
+                       labels={"value": "Index", "index": "Date"})
+    if fig is not None:
+        st.plotly_chart(fig, use_container_width=True)
 elif fred_key:
     st.info("US CPI not available: check your FRED key or date range.")
 
@@ -300,21 +358,18 @@ elif fred_key:
 if not us_cpi.empty:
     if not us_core.empty:
         df_yoy = pd.concat([us_cpi_yoy, us_core_yoy], axis=1).dropna()
-        df_yoy.columns = ["US CPI YoY", "US Core CPI YoY"]
-        fig = px.line(
-            df_yoy,
-            labels={"value": "YoY %", "index": "Date"},
-            title="US YoY inflation (%)"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        if not df_yoy.empty:
+            df_yoy.columns = ["US CPI YoY", "US Core CPI YoY"]
+            fig = safe_px_line(df_yoy, title="US YoY inflation (%)",
+                               labels={"value": "YoY %", "index": "Date"})
+            if fig is not None:
+                st.plotly_chart(fig, use_container_width=True)
     else:
         if not us_cpi_yoy.empty:
-            fig = px.line(
-                us_cpi_yoy,
-                labels={"value": "YoY %", "index": "Date"},
-                title="US CPI YoY (%)"
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            fig = safe_px_line(us_cpi_yoy, title="US CPI YoY (%)",
+                               labels={"value": "YoY %", "index": "Date"})
+            if fig is not None:
+                st.plotly_chart(fig, use_container_width=True)
 else:
     if fred_key:
         st.info("US CPI YoY not available.")
@@ -323,17 +378,20 @@ else:
 colA, colB = st.columns(2)
 with colA:
     if not us_m2.empty:
-        fig = px.line(us_m2, title="US M2 Money Supply (Level)")
-        st.plotly_chart(fig, use_container_width=True)
+        fig = safe_px_line(us_m2, title="US M2 Money Supply (Level)")
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True)
         if not us_m2_yoy.empty:
-            fig2 = px.line(us_m2_yoy, title="US M2 YoY (%)")
-            st.plotly_chart(fig2, use_container_width=True)
+            fig2 = safe_px_line(us_m2_yoy, title="US M2 YoY (%)")
+            if fig2 is not None:
+                st.plotly_chart(fig2, use_container_width=True)
     else:
         st.write("US M2 not available.")
 with colB:
     if not fedfunds.empty:
-        fig = px.line(fedfunds, title="Effective Fed Funds Rate")
-        st.plotly_chart(fig, use_container_width=True)
+        fig = safe_px_line(fedfunds, title="Effective Fed Funds Rate")
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True)
     else:
         st.write("Fed funds not available.")
 
@@ -345,9 +403,15 @@ st.header("India CPI (MoSPI)")
 
 if not ind_cpi.empty:
     st.write("Showing India CPI series parsed from upload.")
-    st.line_chart(ind_cpi["CPI"])
+    try:
+        st.line_chart(ind_cpi["CPI"])
+    except Exception:
+        st.exception(traceback.format_exc())
     if not ind_cpi_yoy.empty:
-        st.line_chart(ind_cpi_yoy)
+        try:
+            st.line_chart(ind_cpi_yoy)
+        except Exception:
+            st.exception(traceback.format_exc())
     csv_bytes = df_to_csv_bytes(ind_cpi)
     st.download_button(
         "Download India CPI (.csv)",
@@ -369,16 +433,15 @@ if countries:
         try:
             wb = fetch_worldbank_inflation(iso, startyear=2010)
             if not wb.empty:
+                # wb is DataFrame indexed by year with column iso
                 wb_frames.append(wb[iso])
         except Exception:
             st.warning(f"World Bank fetch failed for {iso}")
     if wb_frames:
         df_wb = pd.concat(wb_frames, axis=1).dropna()
-        fig = px.line(
-            df_wb,
-            title="Annual inflation (World Bank): selected countries"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        fig = safe_px_line(df_wb, title="Annual inflation (World Bank): selected countries")
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True)
         csv_bytes = df_to_csv_bytes(df_wb)
         st.download_button(
             "Download selected countries inflation (.csv)",
@@ -397,19 +460,21 @@ st.markdown("---")
 if show_forecast:
     st.header("Illustrative nowcast: US CPI (simple EWMA)")
     if not us_cpi.empty:
-        us_cpi_monthly = us_cpi.resample("M").last().dropna()
-        us_cpi_yoy_monthly = us_cpi_monthly.pct_change(12) * 100
-        us_cpi_yoy_monthly = us_cpi_yoy_monthly.dropna()
-        if not us_cpi_yoy_monthly.empty:
-            nowcast = us_cpi_yoy_monthly.ewm(span=3).mean().iloc[-1, 0]
-            st.write(f"Simple EWMA nowcast for US CPI YoY (illustrative): **{nowcast:.2f}%**")
-            fig_now = px.line(
-                us_cpi_yoy_monthly,
-                title="US CPI YoY (monthly) — with nowcast label"
-            )
-            st.plotly_chart(fig_now, use_container_width=True)
-        else:
-            st.info("Not enough monthly US CPI data for nowcast.")
+        try:
+            us_cpi_monthly = us_cpi.resample("M").last().dropna()
+            us_cpi_yoy_monthly = us_cpi_monthly.pct_change(12) * 100
+            us_cpi_yoy_monthly = us_cpi_yoy_monthly.dropna()
+            if not us_cpi_yoy_monthly.empty:
+                nowcast = us_cpi_yoy_monthly.ewm(span=3).mean().iloc[-1, 0]
+                st.write(f"Simple EWMA nowcast for US CPI YoY (illustrative): **{nowcast:.2f}%**")
+                fig_now = safe_px_line(us_cpi_yoy_monthly, title="US CPI YoY (monthly) — with nowcast label")
+                if fig_now is not None:
+                    st.plotly_chart(fig_now, use_container_width=True)
+            else:
+                st.info("Not enough monthly US CPI data for nowcast.")
+        except Exception:
+            st.error("Error computing nowcast:")
+            st.exception(traceback.format_exc())
     else:
         st.info("US CPI data required for nowcast. Provide a FRED API key in the sidebar.")
 
