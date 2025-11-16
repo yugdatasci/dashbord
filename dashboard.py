@@ -326,4 +326,5 @@ elif fred_key:
     st.info("US CPI not available: check your FRED key or date range.")
 
 # US CPI YoY
-if not us
+if not us_cpi.empty:
+
