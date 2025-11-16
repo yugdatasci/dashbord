@@ -48,6 +48,7 @@ def fetch_fred_series(series_id: str, api_key: str, start=None, end=None):
 
 @st.cache_data(ttl=3600)
 def fetch_worldbank_inflation(iso3: str, startyear=2010, endyear=None):
+    """Fetch annual inflation from World Bank for a given ISO3 code."""
     if endyear is None:
         endyear = datetime.today().year
     url = f"https://api.worldbank.org/v2/country/{iso3}/indicator/FP.CPI.TOTL.ZG"
@@ -72,6 +73,9 @@ def fetch_worldbank_inflation(iso3: str, startyear=2010, endyear=None):
 
 
 def yoy_pct_change(df: pd.DataFrame, periods=12):
+    """12-month year-over-year % change."""
+    if df.empty:
+        return pd.DataFrame()
     return df.pct_change(periods=periods) * 100
 
 
@@ -87,7 +91,11 @@ st.sidebar.header("Controls & Data sources")
 
 # FRED API key: try secrets then ask user
 default_fred = st.secrets.get("FRED_API_KEY") if "FRED_API_KEY" in st.secrets else ""
-fred_key = st.sidebar.text_input("FRED API key (optional for US series)", value=default_fred, type="password")
+fred_key = st.sidebar.text_input(
+    "FRED API key (optional for US series)",
+    value=default_fred,
+    type="password"
+)
 
 # Date range
 today = datetime.today().date()
@@ -96,15 +104,25 @@ start_date = st.sidebar.date_input("Start date", value=pd.to_datetime(default_st
 end_date = st.sidebar.date_input("End date", value=pd.to_datetime(today))
 
 # Countries for world comparison
-countries = st.sidebar.multiselect("Compare countries (World Bank ISO3)", ["IND", "USA", "CHN", "GBR", "DEU", "WLD"], default=["IND", "USA"])
+countries = st.sidebar.multiselect(
+    "Compare countries (World Bank ISO3)",
+    ["IND", "USA", "CHN", "GBR", "DEU", "WLD"],
+    default=["IND", "USA"]
+)
 
 # India CPI: allow upload
 st.sidebar.markdown("---")
 st.sidebar.subheader("India CPI (MoSPI)")
-uploaded_file = st.sidebar.file_uploader("Upload MoSPI Excel/CSV (monthly CPI index)", type=["xls", "xlsx", "csv"])
+uploaded_file = st.sidebar.file_uploader(
+    "Upload MoSPI Excel/CSV (monthly CPI index)",
+    type=["xls", "xlsx", "csv"]
+)
 
 # Options
-show_forecast = st.sidebar.checkbox("Show simple CPI nowcast (illustrative)", value=False)
+show_forecast = st.sidebar.checkbox(
+    "Show simple CPI nowcast (illustrative)",
+    value=False
+)
 
 # -------------------------
 # Main layout
@@ -173,7 +191,6 @@ if uploaded_file is not None:
             # csv
             df_try = pd.read_csv(uploaded_file)
             # try common names
-            cols_lower = [str(c).lower() for c in df_try.columns]
             date_candidates = [c for c in df_try.columns if str(c).lower() in ("date", "month", "period")]
             value_candidates = [c for c in df_try.columns if "cpi" in str(c).lower() or "index" in str(c).lower()]
             if date_candidates and value_candidates:
@@ -217,7 +234,7 @@ def last_value(df, col=None):
     if col:
         s = df[col].dropna()
     else:
-        s = df.dropna().iloc[:, 0] if not df.empty else pd.Series()
+        s = df.dropna().iloc[:, 0] if not df.empty else pd.Series(dtype=float)
     if s.empty:
         return None
     return s.iloc[-1]
@@ -267,4 +284,140 @@ if not us_cpi.empty and not us_core.empty:
     left = us_cpi.copy()
     right = us_core.copy()
     left.columns = ["US CPI"]
-    right.columns = ["US
+    right.columns = ["US Core CPI"]
+    df_levels = pd.concat([left, right], axis=1).dropna()
+    fig = px.line(
+        df_levels,
+        labels={"value": "Index", "index": "Date"},
+        title="US CPI (index) and Core CPI"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+elif fred_key:
+    st.info("US CPI not available: check your FRED key or date range.")
+
+# US CPI YoY
+if not us_cpi.empty:
+    if not us_core.empty:
+        df_yoy = pd.concat([us_cpi_yoy, us_core_yoy], axis=1).dropna()
+        df_yoy.columns = ["US CPI YoY", "US Core CPI YoY"]
+        fig = px.line(
+            df_yoy,
+            labels={"value": "YoY %", "index": "Date"},
+            title="US YoY inflation (%)"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        if not us_cpi_yoy.empty:
+            fig = px.line(
+                us_cpi_yoy,
+                labels={"value": "YoY %", "index": "Date"},
+                title="US CPI YoY (%)"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+else:
+    if fred_key:
+        st.info("US CPI YoY not available.")
+
+# US Liquidity (M2) and Fed funds
+colA, colB = st.columns(2)
+with colA:
+    if not us_m2.empty:
+        fig = px.line(us_m2, title="US M2 Money Supply (Level)")
+        st.plotly_chart(fig, use_container_width=True)
+        if not us_m2_yoy.empty:
+            fig2 = px.line(us_m2_yoy, title="US M2 YoY (%)")
+            st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.write("US M2 not available.")
+with colB:
+    if not fedfunds.empty:
+        fig = px.line(fedfunds, title="Effective Fed Funds Rate")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.write("Fed funds not available.")
+
+# -------------------------
+# India CPI section
+# -------------------------
+st.markdown("---")
+st.header("India CPI (MoSPI)")
+
+if not ind_cpi.empty:
+    st.write("Showing India CPI series parsed from upload.")
+    st.line_chart(ind_cpi["CPI"])
+    if not ind_cpi_yoy.empty:
+        st.line_chart(ind_cpi_yoy)
+    csv_bytes = df_to_csv_bytes(ind_cpi)
+    st.download_button(
+        "Download India CPI (.csv)",
+        csv_bytes,
+        file_name="india_cpi.csv"
+    )
+else:
+    st.info("India CPI not available. Upload the MoSPI monthly CPI index (Excel/CSV) using the left sidebar.")
+
+# -------------------------
+# Cross-country annual inflation (World Bank)
+# -------------------------
+st.markdown("---")
+st.header("Cross-country annual inflation (World Bank)")
+
+if countries:
+    wb_frames = []
+    for iso in countries:
+        try:
+            wb = fetch_worldbank_inflation(iso, startyear=2010)
+            if not wb.empty:
+                wb_frames.append(wb[iso])
+        except Exception:
+            st.warning(f"World Bank fetch failed for {iso}")
+    if wb_frames:
+        df_wb = pd.concat(wb_frames, axis=1).dropna()
+        fig = px.line(
+            df_wb,
+            title="Annual inflation (World Bank): selected countries"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        csv_bytes = df_to_csv_bytes(df_wb)
+        st.download_button(
+            "Download selected countries inflation (.csv)",
+            csv_bytes,
+            file_name="worldbank_inflation.csv"
+        )
+    else:
+        st.info("No World Bank data available for selected countries.")
+else:
+    st.write("Select countries in the sidebar to compare.")
+
+# -------------------------
+# Simple nowcast (optional)
+# -------------------------
+st.markdown("---")
+if show_forecast:
+    st.header("Illustrative nowcast: US CPI (simple EWMA)")
+    if not us_cpi.empty:
+        us_cpi_monthly = us_cpi.resample("M").last().dropna()
+        us_cpi_yoy_monthly = us_cpi_monthly.pct_change(12) * 100
+        us_cpi_yoy_monthly = us_cpi_yoy_monthly.dropna()
+        if not us_cpi_yoy_monthly.empty:
+            nowcast = us_cpi_yoy_monthly.ewm(span=3).mean().iloc[-1, 0]
+            st.write(f"Simple EWMA nowcast for US CPI YoY (illustrative): **{nowcast:.2f}%**")
+            fig_now = px.line(
+                us_cpi_yoy_monthly,
+                title="US CPI YoY (monthly) — with nowcast label"
+            )
+            st.plotly_chart(fig_now, use_container_width=True)
+        else:
+            st.info("Not enough monthly US CPI data for nowcast.")
+    else:
+        st.info("US CPI data required for nowcast. Provide a FRED API key in the sidebar.")
+
+# -------------------------
+# Footer
+# -------------------------
+st.markdown("---")
+st.caption(
+    "Data sources: FRED (US series), World Bank (country inflation), "
+    "MoSPI (India CPI via upload). This dashboard is for educational/demo purposes. "
+    "Cite original sources when sharing."
+)
