@@ -83,17 +83,38 @@ def df_to_csv_bytes(df: pd.DataFrame):
     df.to_csv(buf, index=True)
     return buf.getvalue().encode('utf-8')
 
+from pandas import api as pd_api
+
 def plotly_line(df, title=""):
-    """Small helper to normalize dataframe and plot with plotly.express.line"""
+    """Normalize dataframe and plot with plotly.express.line (compat-safe)."""
     if df is None or getattr(df, "empty", True):
-        st.info("No data available for chart.")
+        st.info("No data available for this chart.")
         return
+
     df_plot = df.copy()
-    # If index is datetime or numeric, reset so px can auto-detect x
-    if isinstance(df_plot.index, (pd.DatetimeIndex, pd.Int64Index, pd.Float64Index, pd.Index)):
-        df_plot = df_plot.reset_index()
+
+    try:
+        idx = df_plot.index
+
+        is_dt = pd_api.types.is_datetime64_any_dtype(idx)
+        is_int = pd_api.types.is_integer_dtype(idx)
+        is_float = pd_api.types.is_float_dtype(idx)
+
+        if is_dt or is_int or is_float:
+            df_plot = df_plot.reset_index()
+    except Exception:
+        try:
+            df_plot = df_plot.reset_index()
+        except Exception:
+            pass
+
+    if df_plot.shape[1] == 0:
+        st.info("No plottable columns found.")
+        return
+
     fig = px.line(df_plot, title=title)
     st.plotly_chart(fig, use_container_width=True)
+
 
 # -------------------------
 # Sidebar controls
